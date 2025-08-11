@@ -3,6 +3,8 @@ import express from 'express';
 import passport from 'passport';
 import Driver from '../models/Driver.js';
 import Rider from '../models/Rider.js';
+import Ride from '../models/Ride.js';           // ✨ NEW
+import Activity from '../models/Activity.js';   // ✨ NEW
 import { sendApprovalNotice } from '../bots/driverBot.js';
 
 const router = express.Router();
@@ -38,21 +40,42 @@ router.post('/logout', ensureAdmin, (req, res, next) => {
   });
 });
 
-/* ------------ dashboard ------------ */
+/* ------------ dashboard (richer) ------------ */
 router.get('/', ensureAdmin, async (req, res) => {
-  const [driverCounts, riderCount, drivers] = await Promise.all([
+  const [
+    driverCounts,
+    riderCount,
+    drivers,
+    rideCounts,
+    recentTrips,
+    recentCancels,
+    recentActivity
+  ] = await Promise.all([
     Driver.aggregate([{ $group: { _id: '$status', count: { $sum: 1 } } }]),
     Rider.countDocuments(),
-    Driver.find().sort({ createdAt: -1 }).limit(10).lean()
+    Driver.find().sort({ createdAt: -1 }).limit(10).lean(),
+    Ride.aggregate([{ $group: { _id: '$status', count: { $sum: 1 } } }]),
+    Ride.find().sort({ createdAt: -1 }).limit(8).lean(),
+    Ride.find({ status: 'cancelled' }).sort({ updatedAt: -1 }).limit(8).lean(),
+    Activity.find().sort({ createdAt: -1 }).limit(15).lean()
   ]);
 
   const counts = { totalDrivers: 0, pending: 0, approved: 0, rejected: 0 };
-  driverCounts.forEach(x => {
-    counts.totalDrivers += x.count;
-    counts[x._id] = x.count;
-  });
+  driverCounts.forEach(x => { counts.totalDrivers += x.count; counts[x._id] = x.count; });
 
-  res.render('admin/dashboard', { admin: req.user, counts, riderCount, recentDrivers: drivers });
+  const rideStats = { total: 0, pending: 0, accepted: 0, enroute: 0, completed: 0, cancelled: 0, payment_pending: 0 };
+  rideCounts.forEach(x => { rideStats.total += x.count; rideStats[x._id] = x.count; });
+
+  res.render('admin/dashboard', {
+    admin: req.user,
+    counts,
+    riderCount,
+    recentDrivers: drivers,
+    rideStats,
+    recentTrips,
+    recentCancels,
+    recentActivity
+  });
 });
 
 /* ------------ drivers list ------------ */
@@ -77,10 +100,8 @@ router.post('/drivers/:id/approve', ensureAdmin, async (req, res) => {
 
   d.status = 'approved';
   d.approvedAt = new Date();
-  // no more botPin
   await d.save();
 
-  // Socket broadcast (optional UI update)
   const io = req.app.get('io');
   io?.emit('driver:approved', {
     driverId: String(d._id),
@@ -88,7 +109,6 @@ router.post('/drivers/:id/approve', ensureAdmin, async (req, res) => {
     name: d.name || ''
   });
 
-  // Telegram DM — tell the driver they’re approved
   if (typeof d.chatId === 'number') {
     try {
       await sendApprovalNotice(d.chatId);
@@ -113,6 +133,31 @@ router.post('/drivers/:id/reject', ensureAdmin, async (req, res) => {
   io?.emit('driver:rejected', { driverId: String(d._id), name: d.name || '' });
 
   return res.redirect(`/admin/drivers/${d._id}?ok=Rejected`);
+});
+
+/* ------------ trips list ------------ */
+router.get('/trips', ensureAdmin, async (req, res) => {
+  const q = {};
+  if (req.query.status) q.status = req.query.status;
+
+  const trips = await Ride.find(q)
+    .populate('driverId')
+    .sort({ createdAt: -1 })
+    .limit(100)
+    .lean();
+
+  res.render('admin/trips', { admin: req.user, trips, status: req.query.status || '' });
+});
+
+/* ------------ single trip ------------ */
+router.get('/trips/:id', ensureAdmin, async (req, res) => {
+  const trip = await Ride.findById(req.params.id).populate('driverId').lean();
+  if (!trip) return res.redirect('/admin/trips');
+
+  const activity = await Activity.find({ rideId: trip._id }).sort({ createdAt: 1 }).lean();
+  const tripName = `Trip ${String(trip._id).slice(-6).toUpperCase()}`;
+
+  res.render('admin/trip', { admin: req.user, trip, activity, tripName });
 });
 
 export default router;

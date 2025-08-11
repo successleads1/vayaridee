@@ -1,327 +1,273 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-  <meta charset="utf-8">
-  <title>Live Trip Map</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <script src="https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.js"></script>
-  <link href="https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.css" rel="stylesheet">
+  <meta charset="utf-8" />
+  <title>Live Trip Tracker</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <!-- Socket.io -->
   <script src="/socket.io/socket.io.js"></script>
+
+  <!-- Google Maps (Directions + Geometry) -->
+  <script>
+    // 🔑 Put your key here (you shared this one)
+    window.GMAPS_KEY = "AIzaSyAP2Q-t-kEbFRgsQowQvTJPPROt6d47Smo";
+  </script>
+  <script id="gloader" async defer></script>
+
   <style>
     :root {
-      --driver-size: 28px;
-      --viewer-size: 18px;
-      --pickup-size: 18px;
+      --driver: #ff2b2b;
+      --rider:  #19d66b;
+      --dest:   #ffffff;
+      --viewer: #1b8cff;
     }
-    body { margin: 0; padding: 0; }
+    html, body { height: 100%; margin: 0; }
     #map { position: absolute; inset: 0; }
-
-    /* DRIVER: big, layered, impossible to miss */
-    .driver-wrap { position: relative; width: var(--driver-size); height: var(--driver-size); }
-    .driver-halo {
-      position: absolute; inset: -12px;
-      border-radius: 50%;
-      background: radial-gradient(rgba(255,255,255,0.9), rgba(255,255,255,0.0) 60%);
-      filter: blur(2px);
-      pointer-events: none;
-    }
-    .driver-core {
-      position: absolute; inset: 0;
-      border-radius: 50%;
-      background: #ff2b2b; /* solid red */
-      border: 3px solid white;
-      box-shadow: 0 0 18px rgba(255,0,0,0.8);
-      animation: pulse 1.2s infinite;
-    }
-
-    /* PICKUP (rider) and viewer */
-    .dot { width: var(--pickup-size); height: var(--pickup-size); border-radius: 50%; border: 2px solid #fff; }
-    .pickup-dot { background: #19d66b; box-shadow: 0 0 10px rgba(0,255,100,0.7); }
-    .viewer-dot { width: var(--viewer-size); height: var(--viewer-size); background: #1b8cff; box-shadow: 0 0 10px rgba(0,128,255,0.7); }
-
-    /* Labels */
-    .marker-label {
-      position: absolute;
-      top: -26px; left: -30px; width: 120px;
-      color: #fff; font: 700 13px/1.2 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-      text-align: center; text-shadow: 0 2px 3px rgba(0,0,0,0.7); letter-spacing: .3px;
-      pointer-events: none;
-    }
-
-    /* Controls / toast */
-    .map-btn {
-      position: absolute; top: 10px; left: 10px; z-index: 10;
-      background: #111; color: #fff; padding: 10px 14px; border-radius: 6px;
+    .topbar {
+      position: absolute; z-index: 2; top: 10px; left: 10px;
+      display: flex; gap: 8px; flex-wrap: wrap;
       font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
     }
-    .map-btn:hover { background:#333; cursor:pointer; }
-    .toast {
-      position: absolute; right: 10px; top: 10px; z-index: 10;
-      background: rgba(0,0,0,.75); color:#fff; padding:10px 12px; border-radius:8px; font: 13px/1.3 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
-      max-width: 60vw; display:none;
+    .btn {
+      appearance: none; border: 1px solid #222; background: #111; color: #fff;
+      padding: 8px 12px; border-radius: 8px; cursor: pointer;
     }
-
-    @keyframes pulse {
-      0%   { transform: scale(1); box-shadow: 0 0 18px rgba(255,0,0,0.8); }
-      50%  { transform: scale(1.25); box-shadow: 0 0 28px rgba(255,0,0,0.6); }
-      100% { transform: scale(1); box-shadow: 0 0 18px rgba(255,0,0,0.8); }
+    .btn:hover { filter: brightness(1.2); }
+    .toast {
+      position: absolute; z-index: 2; right: 10px; top: 10px;
+      background: rgba(0,0,0,.8); color:#fff; padding:10px 12px; border-radius:8px;
+      font: 13px/1.3 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; display:none;
+      max-width: 70vw;
     }
   </style>
 </head>
 <body>
   <div id="map"></div>
-  <div class="map-btn" onclick="window.open('https://t.me/vayarider_bot')">🔙 Back to App</div>
+
+  <div class="topbar">
+    <button class="btn" id="btnBack">🔙 Back to App</button>
+    <button class="btn" id="btnCenter">🎯 Center</button>
+    <button class="btn" id="btnShare">🔗 Copy Link</button>
+  </div>
   <div id="toast" class="toast"></div>
 
-<script>
-  /* ====================== CONFIG ====================== */
-  mapboxgl.accessToken = 'pk.eyJ1IjoibWJ1c2lzZW5pIiwiYSI6ImNseTF3ZjZ0ajB6anUyanMyc3RmNzByem0ifQ.PCctEHWWSdY7rr0RTe28Xg';
-  const rideId = window.location.pathname.split('/').pop();
-  const rideChannel = `ride:${rideId}:driverLocation`;
-  const socket = io();
+  <script>
+    /* =========================
+       Query + Channels
+       ========================= */
+    const q = new URLSearchParams(location.search);
+    const rideId = q.get('rideId') || null;
+    let driverChatId = q.get('driverChatId') || null;
 
-  console.log('🧪 map boot — rideId:', rideId);
-  console.log('📡 subscribing to ride channel:', rideChannel);
+    const rideChannel   = rideId ? `ride:${rideId}:driverLocation` : null;
+    const fallbackTopic = (cid) => `driver:${cid}:location`;
 
-  /* ====================== MAP ====================== */
-  const map = new mapboxgl.Map({
-    container: 'map',
-    style: 'mapbox://styles/mapbox/dark-v11',
-    center: [18.4241, -33.9249],
-    zoom: 12
-  });
+    const socket = io();
 
-  let mapReady = false;
-  map.on('load', () => {
-    mapReady = true;
-    console.log('🗺️ Map loaded.');
-  });
-
-  /* ====================== UI helpers ====================== */
-  function toast(msg, dur=2500) {
-    const el = document.getElementById('toast');
-    el.textContent = msg;
-    el.style.display = 'block';
-    clearTimeout(toast._t);
-    toast._t = setTimeout(() => (el.style.display='none'), dur);
-  }
-
-  function makeDriverElement() {
-    const wrap = document.createElement('div');
-    wrap.className = 'driver-wrap';
-    const label = document.createElement('div');
-    label.className = 'marker-label';
-    label.textContent = 'DRIVER';
-    const halo = document.createElement('div');
-    halo.className = 'driver-halo';
-    const core = document.createElement('div');
-    core.className = 'driver-core';
-    wrap.appendChild(label);
-    wrap.appendChild(halo);
-    wrap.appendChild(core);
-    return wrap;
-  }
-  function makePickupElement(labelText='RIDER') {
-    const wrap = document.createElement('div');
-    const label = document.createElement('div');
-    label.className = 'marker-label';
-    label.textContent = labelText;
-    const dot = document.createElement('div');
-    dot.className = 'dot pickup-dot';
-    wrap.appendChild(label);
-    wrap.appendChild(dot);
-    return wrap;
-  }
-  function makeViewerElement() {
-    const wrap = document.createElement('div');
-    const dot = document.createElement('div');
-    dot.className = 'viewer-dot';
-    wrap.appendChild(dot);
-    return wrap;
-  }
-
-  /* ====================== STATE ====================== */
-  let driverMarker = null;
-  let driverCoord = null;   // [lng, lat]
-  let driverChatId = null;  // will be filled from API
-  let pickupCoord = null;   // [lng, lat]
-  let firstDriverFixDone = false;
-
-  let viewerMarker = null;
-
-  const ROUTE_SRC = 'route-src';
-  const ROUTE_LAYER = 'route-layer';
-  const STRAIGHT_SRC = 'straight-src';
-  const STRAIGHT_LAYER = 'straight-layer';
-
-  /* ====================== ROUTING ====================== */
-  async function drawRoute(driverLngLat, riderLngLat) {
-    if (!mapReady) return;
-    console.log('🛣️ Mapbox Directions DRIVER→RIDER:', driverLngLat, riderLngLat);
-    try {
-      const url = `https://api.mapbox.com/directions/v5/mapbox/driving/${driverLngLat.join(',')};${riderLngLat.join(',')}?geometries=geojson&access_token=${mapboxgl.accessToken}`;
-      const res = await fetch(url);
-      const data = await res.json();
-      if (!data.routes?.length) throw new Error('No routes returned');
-      const geo = { type: 'Feature', geometry: data.routes[0].geometry };
-
-      if (map.getLayer(STRAIGHT_LAYER)) map.removeLayer(STRAIGHT_LAYER);
-      if (map.getSource(STRAIGHT_SRC)) map.removeSource(STRAIGHT_SRC);
-
-      if (map.getSource(ROUTE_SRC)) {
-        map.getSource(ROUTE_SRC).setData(geo);
-      } else {
-        map.addSource(ROUTE_SRC, { type: 'geojson', data: geo });
-        map.addLayer({
-          id: ROUTE_LAYER,
-          type: 'line',
-          source: ROUTE_SRC,
-          layout: { 'line-cap': 'round', 'line-join': 'round' },
-          paint: { 'line-color': '#00ffff', 'line-width': 4 }
-        });
-      }
-      console.log('✅ Route line drawn (points):', geo.geometry.coordinates.length);
-    } catch (err) {
-      console.warn('⚠️ Directions failed, drawing straight line.', err?.message || err);
-      const straight = {
-        type: 'Feature',
-        geometry: { type: 'LineString', coordinates: [driverLngLat, riderLngLat] }
-      };
-      if (map.getSource(STRAIGHT_SRC)) {
-        map.getSource(STRAIGHT_SRC).setData(straight);
-      } else {
-        map.addSource(STRAIGHT_SRC, { type: 'geojson', data: straight });
-        map.addLayer({
-          id: STRAIGHT_LAYER,
-          type: 'line',
-          source: STRAIGHT_SRC,
-          layout: { 'line-cap': 'round', 'line-join': 'round' },
-          paint: { 'line-color': '#ffcc00', 'line-width': 3, 'line-dasharray': [1.5, 1.5] }
-        });
-      }
-      console.log('➡️ Fallback straight line drawn.');
+    /* =========================
+       Toast / UI helpers
+       ========================= */
+    const toastEl = document.getElementById('toast');
+    function toast(msg, dur=2500) {
+      toastEl.textContent = msg;
+      toastEl.style.display = 'block';
+      clearTimeout(toast._t);
+      toast._t = setTimeout(() => (toastEl.style.display='none'), dur);
     }
-  }
-
-  function fitDriverAndPickup() {
-    if (!driverCoord || !pickupCoord || !mapReady) return;
-    const b = new mapboxgl.LngLatBounds();
-    b.extend(driverCoord);
-    b.extend(pickupCoord);
-    console.log('🧭 fitBounds DRIVER+PICKUP:', driverCoord, pickupCoord);
-    map.fitBounds(b, { padding: 100, maxZoom: 16, duration: 600 });
-  }
-
-  /* ====================== CHANNEL SUBSCRIPTIONS ====================== */
-  function onDriverLocation(loc) {
-    console.log('🚚 driver tick:', loc);
-    if (!loc || typeof loc.lat !== 'number' || typeof loc.lng !== 'number') {
-      console.warn('⚠️ bad driver payload:', loc);
-      return;
-    }
-    driverCoord = [loc.lng, loc.lat];
-    console.log(`📍 DRIVER drawn -> lng=${driverCoord[0]}, lat=${driverCoord[1]}`);
-
-    if (!driverMarker) {
-      driverMarker = new mapboxgl.Marker({ element: makeDriverElement() })
-        .setLngLat(driverCoord)
-        .addTo(map);
-      driverMarker.getElement().style.zIndex = '1000';
-      console.log('🧲 DRIVER marker created');
-    } else {
-      driverMarker.setLngLat(driverCoord);
+    document.getElementById('btnBack').onclick = () => window.open('https://t.me/vayarider_bot', '_blank');
+    document.getElementById('btnShare').onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(location.href);
+        toast('Link copied.');
+      } catch { toast('Copy failed.'); }
     }
 
-    if (!firstDriverFixDone) {
-      firstDriverFixDone = true;
-      toast('🚗 Driver found — centering');
-      if (pickupCoord) fitDriverAndPickup();
-      else map.flyTo({ center: driverCoord, zoom: 14, duration: 500 });
-    }
+    /* =========================
+       Google Maps boot
+       ========================= */
+    let gmap, bounds, dirService, dirRenderer;
+    let driverMarker=null, pickupMarker=null, destMarker=null, youMarker=null;
 
-    if (pickupCoord) drawRoute(driverCoord, pickupCoord);
-  }
-
-  // Primary ride-specific channel
-  socket.on(rideChannel, onDriverLocation);
-
-  // Later we will attach a driver-specific fallback: driver:<chatId>:location
-  function subscribeDriverFallback(chatId) {
-    if (!chatId) return;
-    const ch = `driver:${chatId}:location`;
-    console.log('📡 subscribing to driver fallback channel:', ch);
-    socket.on(ch, onDriverLocation);
-  }
-
-  /* ====================== LOAD STATIC RIDE DATA ====================== */
-  fetch(`/api/ride/${rideId}`)
-    .then(r => {
-      console.log('📶 /api/ride status:', r.status);
-      if (!r.ok) throw new Error('Ride not found');
-      return r.json();
-    })
-    .then(data => {
-      const { pickup, destination, riderName, driverChatId: dChat } = data;
-      driverChatId = dChat ?? null;
-      if (driverChatId) subscribeDriverFallback(driverChatId);
-
-      pickupCoord = [pickup.lng, pickup.lat];
-      console.log('📦 Ride loaded. pickup:', pickupCoord, 'dest:', [destination.lng, destination.lat], 'driverChatId:', driverChatId);
-
-      new mapboxgl.Marker({ element: makePickupElement(riderName || 'RIDER') })
-        .setLngLat(pickupCoord)
-        .addTo(map);
-
-      new mapboxgl.Marker({ color: 'white' })
-        .setLngLat([destination.lng, destination.lat])
-        .setPopup(new mapboxgl.Popup().setText('Destination'))
-        .addTo(map);
-
-      // If we already have a driver point, fit both; else show pickup+destination
-      if (driverCoord) fitDriverAndPickup();
-      else map.fitBounds([[pickup.lng, pickup.lat], [destination.lng, destination.lat]], { padding: 100 });
-    })
-    .catch(err => {
-      console.error('❌ Ride fetch error:', err);
-      toast('Could not load ride details');
-    });
-
-  /* ====================== VIEWER GEO (optional logs) ====================== */
-  function placeViewer(lat, lng) {
-    const coord = [lng, lat];
-    if (!viewerMarker) {
-      viewerMarker = new mapboxgl.Marker({ element: makeViewerElement() })
-        .setLngLat(coord)
-        .addTo(map);
-      console.log('👀 viewer marker placed:', coord);
-    } else {
-      viewerMarker.setLngLat(coord);
-    }
-  }
-
-  function startViewerGeo() {
-    if (!('geolocation' in navigator)) return;
-    navigator.geolocation.getCurrentPosition(
-      (pos) => {
-        const { latitude, longitude } = pos.coords;
-        console.log('✅ viewer permission ok, first fix:', latitude, longitude);
-        placeViewer(latitude, longitude);
-        navigator.geolocation.watchPosition(
-          (p) => {
-            const { latitude: lat, longitude: lng } = p.coords;
-            placeViewer(lat, lng);
-            socket.emit('viewer:location', { rideId, lat, lng, ts: new Date().toISOString() });
-          },
-          (err) => console.warn('viewer watch error:', err),
-          { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 }
-        );
+    const ICONS = {
+      driver: {
+        path: googleLikeCirclePath(12),
+        fillColor: getCSS('--driver'), fillOpacity: 1,
+        strokeColor: "#ffffff", strokeWeight: 3, scale: 1, anchor: {x:12, y:12}
       },
-      (err) => console.warn('viewer geolocation denied:', err),
-      { enableHighAccuracy: true, maximumAge: 0, timeout: 10000 }
-    );
-  }
+      rider: {
+        path: googleLikeCirclePath(8),
+        fillColor: getCSS('--rider'), fillOpacity: 1,
+        strokeColor: "#ffffff", strokeWeight: 2, scale: 1, anchor: {x:8, y:8}
+      },
+      dest: {
+        path: googleLikeCirclePath(8),
+        fillColor: getCSS('--dest'), fillOpacity: 1,
+        strokeColor: "#000000", strokeWeight: 2, scale: 1, anchor: {x:8, y:8}
+      },
+      you: {
+        path: googleLikeCirclePath(6),
+        fillColor: getCSS('--viewer'), fillOpacity: 1,
+        strokeColor: "#ffffff", strokeWeight: 2, scale: 1, anchor: {x:6, y:6}
+      }
+    };
 
-  map.on('load', startViewerGeo);
-</script>
+    function getCSS(varname){ return getComputedStyle(document.documentElement).getPropertyValue(varname).trim(); }
+    function googleLikeCirclePath(r){ return `M ${r},0 A ${r},${r} 0 1,0 ${-r},0 A ${r},${r} 0 1,0 ${r},0 z`; }
+
+    function loadGoogle() {
+      return new Promise((resolve, reject) => {
+        if (window.google && window.google.maps) return resolve();
+        const s = document.getElementById('gloader');
+        s.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(window.GMAPS_KEY)}&libraries=geometry&v=quarterly`;
+        s.onerror = () => reject(new Error('Google Maps failed to load'));
+        s.onload  = () => {
+          if (window.google && window.google.maps) resolve();
+          else reject(new Error('Google Maps missing after load'));
+        };
+      });
+    }
+
+    function initMap() {
+      gmap = new google.maps.Map(document.getElementById('map'), {
+        center: { lat: -33.9249, lng: 18.4241 }, // Cape Town default
+        zoom: 12,
+        clickableIcons: false,
+        gestureHandling: 'greedy',
+        mapTypeControl: false,
+        streetViewControl: false,
+        fullscreenControl: false
+      });
+      bounds = new google.maps.LatLngBounds();
+      dirService = new google.maps.DirectionsService();
+      dirRenderer = new google.maps.DirectionsRenderer({
+        map: gmap, suppressMarkers: true,
+        polylineOptions: { strokeColor: '#00ffff', strokeWeight: 5 }
+      });
+
+      document.getElementById('btnCenter').onclick = centerAll;
+    }
+
+    function setOrMoveMarker(ref, pos, icon) {
+      if (!ref) return new google.maps.Marker({ map: gmap, position: pos, icon });
+      ref.setPosition(pos);
+      return ref;
+    }
+
+    function centerAll() {
+      if (!bounds.isEmpty()) gmap.fitBounds(bounds, 80);
+    }
+
+    function addBound(lat, lng) {
+      bounds.extend(new google.maps.LatLng(lat, lng));
+    }
+
+    let pickupCoord=null, destCoord=null, driverCoord=null;
+
+    async function drawRoute() {
+      if (!driverCoord || !pickupCoord) return;
+      try {
+        const req = {
+          origin:  { lat: driverCoord.lat, lng: driverCoord.lng },
+          destination: { lat: pickupCoord.lat, lng: pickupCoord.lng },
+          travelMode: google.maps.TravelMode.DRIVING
+        };
+        const res = await dirService.route(req);
+        dirRenderer.setDirections(res);
+      } catch (e) {
+        // Fallback: straight polyline
+        const line = new google.maps.Polyline({
+          path: [driverCoord, pickupCoord],
+          strokeColor: '#ffcc00',
+          strokeOpacity: 1,
+          strokeWeight: 3,
+          icons: [{ icon: { path: 'M 0,-1 0,1', strokeOpacity: 1, scale: 3 }, offset: '0', repeat: '12px' }]
+        });
+        line.setMap(gmap);
+      }
+    }
+
+    function handleDriverLoc({ lat, lng }) {
+      if (typeof lat !== 'number' || typeof lng !== 'number') return;
+      driverCoord = { lat, lng };
+      driverMarker = setOrMoveMarker(driverMarker, driverCoord, ICONS.driver);
+      addBound(lat, lng);
+      drawRoute();
+    }
+
+    function startViewerGeo() {
+      if (!('geolocation' in navigator)) return;
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          const { latitude, longitude } = pos.coords;
+          youMarker = setOrMoveMarker(youMarker, { lat: latitude, lng: longitude }, ICONS.you);
+          socket.emit('viewer:location', { rideId, lat: latitude, lng: longitude, ts: Date.now() });
+        },
+        () => {},
+        { enableHighAccuracy: true, maximumAge: 0, timeout: 12000 }
+      );
+      navigator.geolocation.watchPosition(
+        (p) => {
+          const { latitude, longitude } = p.coords;
+          youMarker = setOrMoveMarker(youMarker, { lat: latitude, lng: longitude }, ICONS.you);
+          socket.emit('viewer:location', { rideId, lat: latitude, lng: longitude, ts: Date.now() });
+        },
+        () => {},
+        { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 }
+      );
+    }
+
+    /* =========================
+       Boot sequence
+       ========================= */
+    (async function main(){
+      try {
+        await loadGoogle();
+        initMap();
+        startViewerGeo();
+
+        // If rideId provided, fetch static data
+        if (rideId) {
+          const r = await fetch(`/api/ride/${rideId}`);
+          if (!r.ok) throw new Error('Ride not found');
+          const data = await r.json();
+          const { pickup, destination, riderName, driverChatId: dcid } = data || {};
+          if (dcid) driverChatId = dcid;
+
+          pickupCoord = { lat: pickup.lat, lng: pickup.lng };
+          destCoord   = { lat: destination.lat, lng: destination.lng };
+
+          // Markers
+          pickupMarker = setOrMoveMarker(pickupMarker, pickupCoord, ICONS.rider);
+          destMarker   = setOrMoveMarker(destMarker,   destCoord,   ICONS.dest);
+
+          addBound(pickupCoord.lat, pickupCoord.lng);
+          addBound(destCoord.lat, destCoord.lng);
+
+          // Subscribe to ride-specific channel
+          if (rideChannel) {
+            socket.on(rideChannel, handleDriverLoc);
+          }
+          // And also subscribe to driver fallback if we know it
+          if (driverChatId) {
+            socket.on(fallbackTopic(driverChatId), handleDriverLoc);
+          }
+
+          toast('Live map ready. Tracking driver…');
+          centerAll();
+        }
+
+        // Driver-only link: just subscribe to driver channel
+        if (!rideId && driverChatId) {
+          socket.on(fallbackTopic(driverChatId), handleDriverLoc);
+          toast('Tracking driver…');
+        }
+
+      } catch (e) {
+        console.error(e);
+        toast('Map failed to load. Check your Google API key restrictions.');
+      }
+    })();
+  </script>
 </body>
 </html>

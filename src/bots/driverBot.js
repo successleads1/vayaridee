@@ -6,14 +6,12 @@ import Ride from '../models/Ride.js';
 
 export const driverEvents = new EventEmitter();
 
-// singletons for this Node process
+// singletons
 let bot = null;
 let ioRef = null;
 
-// small utils
+// utils
 const toNum = (v) => (v == null ? v : Number(v));
-const hasNumericChatId = (d) =>
-  d && typeof d.chatId !== 'undefined' && !Number.isNaN(Number(d.chatId));
 
 function onlineKeyboard(isOnline) {
   return {
@@ -30,9 +28,7 @@ function onlineKeyboard(isOnline) {
 function locationKeyboard() {
   return {
     reply_markup: {
-      keyboard: [
-        [{ text: 'Send Live Location 📍', request_location: true }]
-      ],
+      keyboard: [[{ text: 'Send Live Location 📍', request_location: true }]],
       resize_keyboard: true,
       one_time_keyboard: false
     }
@@ -48,7 +44,6 @@ async function setAvailability(chatId, isOnline) {
   return driver;
 }
 
-// Try linking by telegram username if chatId not already set
 async function getOrLinkDriverByChat(msg) {
   const chatId = toNum(msg.chat.id);
   let driver = await Driver.findOne({ chatId });
@@ -69,7 +64,6 @@ async function getOrLinkDriverByChat(msg) {
   return driver;
 }
 
-// MANUAL link by email (collision-safe)
 async function linkDriverByEmail(email, msg) {
   const chatId = toNum(msg.chat.id);
   const tgUsername = msg.from?.username || null;
@@ -79,10 +73,8 @@ async function linkDriverByEmail(email, msg) {
     'i'
   );
 
-  // free this chatId from any other doc (avoid E11000)
   await Driver.updateMany({ chatId }, { $unset: { chatId: '' } });
 
-  // attach chatId to intended driver
   const driver = await Driver.findOneAndUpdate(
     { email: emailRegex },
     { $set: { chatId, telegramUsername: tgUsername } },
@@ -101,6 +93,25 @@ async function sendApprovalNoticeInternal(chatId) {
   );
 }
 
+// common inline controls shown after a driver ACCEPTs
+function tripControls(rideId) {
+  return {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: '📍 Arrived at Pickup', callback_data: `arrived_${rideId}` }
+        ],
+        [
+          { text: '▶️ Start Trip', callback_data: `start_${rideId}` }
+        ],
+        [
+          { text: '❌ Cancel Ride', callback_data: `cancel_${rideId}` }
+        ]
+      ]
+    }
+  };
+}
+
 export function initDriverBot(io) {
   if (bot) {
     ioRef = io || ioRef;
@@ -112,11 +123,20 @@ export function initDriverBot(io) {
   if (!token) throw new Error('TELEGRAM_DRIVER_BOT_TOKEN is not defined in .env');
 
   ioRef = io || null;
-  bot = new TelegramBot(token, { polling: true });
+  bot = new TelegramBot(token, {
+    polling: {
+      interval: 300,
+      autoStart: true,
+      params: {
+        timeout: 10,
+        allowed_updates: ['message', 'edited_message', 'callback_query']
+      }
+    }
+  });
 
   const pendingCancellations = new Map();
 
-  // expose approval helper for other modules
+  // expose approval helper
   bot.sendApprovalNotice = sendApprovalNoticeInternal;
 
   /* ---------------- /start ---------------- */
@@ -150,7 +170,6 @@ export function initDriverBot(io) {
       onlineKeyboard(isOnline)
     );
 
-    // always remind how to share location
     await bot.sendMessage(
       chatId,
       'When ONLINE, share your **live location** so riders can be matched to you.',
@@ -258,13 +277,14 @@ export function initDriverBot(io) {
   });
 
   /* ---------------- location ---------------- */
-  bot.on('location', async (msg) => {
+  bot.on('message', async (msg) => {
+    if (!msg?.location) return;
     const chatId = toNum(msg.chat.id);
     const { latitude, longitude } = msg.location || {};
     if (typeof latitude !== 'number' || typeof longitude !== 'number') return;
 
-    // Persist latest location + mark online (so they’re discoverable)
-    const driver = await Driver.findOneAndUpdate(
+    // Persist latest location + mark online
+    await Driver.findOneAndUpdate(
       { chatId },
       {
         $set: {
@@ -276,14 +296,6 @@ export function initDriverBot(io) {
       { new: true }
     );
 
-    if (!driver) {
-      await bot.sendMessage(
-        chatId,
-        "❌ I can't find your driver profile. If you registered on the site, link it by sending:\n\nLINK your@email.com"
-      );
-      return;
-    }
-
     // Emit for maps/clients
     driverEvents.emit('driver:location', {
       chatId,
@@ -291,8 +303,32 @@ export function initDriverBot(io) {
       location: { lat: latitude, lng: longitude }
     });
 
-    // Tiny acknowledgement (don’t spam every update)
-    await bot.sendMessage(chatId, '📍 Location updated. Thanks!');
+    // Tiny acknowledgement
+    try { await bot.sendMessage(chatId, '📍 Location updated. Thanks!'); } catch {}
+  });
+
+  /* LIVE location edits from Telegram (driver live location keeps moving) */
+  bot.on('edited_message', async (msg) => {
+    if (!msg?.location) return;
+    const chatId = Number(msg.chat.id);
+    const { latitude, longitude } = msg.location;
+
+    await Driver.findOneAndUpdate(
+      { chatId },
+      {
+        $set: {
+          location: { lat: latitude, lng: longitude },
+          lastSeenAt: new Date(),
+          isAvailable: true
+        }
+      }
+    );
+
+    driverEvents.emit('driver:location', {
+      chatId,
+      driverId: chatId,
+      location: { lat: latitude, lng: longitude }
+    });
   });
 
   /* ------------- inline button actions -------------- */
@@ -336,22 +372,22 @@ export function initDriverBot(io) {
         return;
       }
 
-      // ride actions
+      // ride actions: ACCEPT/IGNORE from the offer
       if (data.startsWith('accept_')) {
         const rideId = data.replace('accept_', '');
         const ride = await Ride.findById(rideId);
         if (!ride) return;
 
+        // store accepting driver on ride
+        const driver = await Driver.findOne({ chatId });
+        if (driver) ride.driverId = driver._id;
+
         ride.status = 'accepted';
         await ride.save();
-        await bot.sendMessage(chatId, '✅ You accepted the ride.');
+
+        await bot.sendMessage(chatId, '✅ You accepted the ride.', tripControls(rideId));
         driverEvents.emit('ride:accepted', { driverId: chatId, rideId });
 
-        await bot.sendMessage(chatId, '❌ If you want to cancel this ride:', {
-          reply_markup: {
-            inline_keyboard: [[{ text: 'Cancel Ride', callback_data: `cancel_${rideId}` }]]
-          }
-        });
         return;
       }
 
@@ -368,10 +404,48 @@ export function initDriverBot(io) {
         return;
       }
 
+      // new: arrived at pickup
+      if (data.startsWith('arrived_')) {
+        const rideId = data.replace('arrived_', '');
+        const ride = await Ride.findById(rideId);
+        if (!ride) return;
+
+        await bot.answerCallbackQuery({ callback_query_id: query.id, text: 'Marked arrived' });
+        await bot.sendMessage(chatId, '📍 Marked as arrived at pickup.', tripControls(rideId));
+
+        // server will notify rider
+        driverEvents.emit('ride:arrived', { driverId: chatId, rideId });
+        return;
+      }
+
+      // new: start trip (set status → enroute)
+      if (data.startsWith('start_')) {
+        const rideId = data.replace('start_', '');
+        const ride = await Ride.findById(rideId);
+        if (!ride) return;
+
+        ride.status = 'enroute';
+        await ride.save();
+
+        await bot.answerCallbackQuery({ callback_query_id: query.id, text: 'Trip started' });
+        await bot.sendMessage(chatId, '▶️ Trip started.', {
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '❌ Cancel Ride', callback_data: `cancel_${rideId}` }]
+            ]
+          }
+        });
+
+        // server will notify rider
+        driverEvents.emit('ride:started', { driverId: chatId, rideId });
+        return;
+      }
+
+      // cancel flow (with reasons)
       if (data.startsWith('cancel_')) {
         const rideId = data.replace('cancel_', '');
         const ride = await Ride.findById(rideId);
-        if (!ride || ride.status !== 'accepted') {
+        if (!ride || (ride.status !== 'accepted' && ride.status !== 'enroute')) {
           await bot.sendMessage(chatId, '🚫 No active ride to cancel.');
           return;
         }
@@ -431,7 +505,7 @@ export function initDriverBot(io) {
   return bot;
 }
 
-// helper you can call from admin route (or anywhere) without re-initting the bot
+// helper you can call from admin route (or anywhere)
 export async function sendApprovalNotice(chatId) {
   if (!bot) throw new Error('Driver bot not initialized. Call initDriverBot(io) first.');
   if (chatId == null) {
@@ -445,5 +519,4 @@ export async function sendApprovalNotice(chatId) {
   }
 }
 
-// optional named export if you still want direct access
 export { bot as driverBot };

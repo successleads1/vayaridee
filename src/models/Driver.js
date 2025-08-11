@@ -1,3 +1,4 @@
+// src/models/Driver.js
 import mongoose from 'mongoose';
 
 const DriverSchema = new mongoose.Schema({
@@ -5,14 +6,25 @@ const DriverSchema = new mongoose.Schema({
   email: { type: String, index: true, unique: true, sparse: true },
   passwordHash: { type: String },
 
+  // single category the driver serves
   vehicleType: { type: String, enum: ['normal', 'comfort', 'luxury', 'xl'], default: 'normal' },
+
   status: { type: String, enum: ['pending', 'approved', 'rejected'], default: 'pending' },
 
   chatId: Number,
   location: { lat: Number, lng: Number },
   isAvailable: { type: Boolean, default: false },
 
-  // NEW: Telegram login PIN + approval timestamp
+  // OPTIONAL: per-driver pricing overrides (dynamic pricing from driver)
+  // If a field is missing, we’ll fall back to the default table for that vehicleType
+  pricing: {
+    baseFare:   { type: Number, default: 0 },   // flat added always
+    perKm:      { type: Number },                // e.g. 9
+    minCharge:  { type: Number },                // e.g. 35
+    withinKm:   { type: Number }                 // e.g. 25
+  },
+
+  // Telegram login PIN + approval timestamp
   botPin: { type: String },        // e.g. "482913"
   approvedAt: { type: Date },
 
