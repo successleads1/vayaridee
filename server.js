@@ -3,6 +3,7 @@ import 'dotenv/config';
 import express from 'express';
 import http from 'http';
 import path from 'path';
+import fs from 'fs';
 import mongoose from 'mongoose';
 import { Server as SocketIO } from 'socket.io';
 import { fileURLToPath } from 'url';
@@ -20,11 +21,19 @@ import Ride from './src/models/Ride.js';
 import Driver from './src/models/Driver.js';
 import Rider from './src/models/Rider.js';
 import Admin from './src/models/Admin.js';
-import Activity from './src/models/Activity.js'; // ✨ NEW
+import Activity from './src/models/Activity.js';
 
 /* ---- Bots ---- */
 import { initRiderBot, riderEvents, riderBot as RB } from './src/bots/riderBot.js';
 import { initDriverBot, driverEvents, driverBot as DB } from './src/bots/driverBot.js';
+import {
+  initWhatsappBot,
+  waitForQrDataUrl,
+  isWhatsAppConnected,
+  getConnectionStatus,
+  sendWhatsAppMessage,
+  resetWhatsAppSession,
+} from './src/bots/whatsappBot.js';
 
 /* ---- Services ---- */
 import { assignNearestDriver, setEstimateOnRide, hasNumericChatId } from './src/services/assignment.js';
@@ -42,6 +51,32 @@ const PORT = process.env.PORT || 3000;
 /* ---------------- Mongo ---------------- */
 await mongoose.connect(process.env.MONGODB_URI);
 console.log('✅ MongoDB connected');
+
+/* ---------------- Init Bots ---------------- */
+initWhatsappBot();                  // WhatsApp (new)
+const riderBot = initRiderBot(io);  // Telegram rider (unchanged)
+const driverBot = initDriverBot(io);// Telegram driver (unchanged)
+console.log('🤖 Rider bot initialized');
+console.log('🚗 Driver bot initialized');
+
+/* ---------------- App setup ---------------- */
+app.set('view engine', 'ejs');
+app.set('views', path.join(__dirname, 'src/views'));
+app.use(morgan('dev'));
+app.use(express.static(path.join(__dirname, 'public'))); // serves /wa-qr.png
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use(
+  session({
+    secret: process.env.SESSION_SECRET || 'devsecret',
+    resave: false,
+    saveUninitialized: false,
+    cookie: { maxAge: 12 * 60 * 60 * 1000 },
+  })
+);
+app.use(passport.initialize());
+app.use(passport.session());
+app.use((req, res, next) => { res.locals.user = req.user || null; next(); });
 
 /* ---------------- Seed Admin (optional) ---------------- */
 async function ensureSeedAdmin() {
@@ -61,32 +96,6 @@ async function ensureSeedAdmin() {
   console.log('🛡️ Seeded admin:', ADMIN_EMAIL);
 }
 await ensureSeedAdmin();
-
-/* ---------------- Bots ---------------- */
-const riderBot = initRiderBot(io);
-const driverBot = initDriverBot(io);
-
-/* ---------------- App setup ---------------- */
-app.set('view engine', 'ejs');
-app.set('views', path.join(__dirname, 'src/views'));
-app.use(morgan('dev'));
-app.use(express.static(path.join(__dirname, 'public')));
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-app.use(
-  session({
-    secret: process.env.SESSION_SECRET || 'devsecret',
-    resave: false,
-    saveUninitialized: false,
-    cookie: { maxAge: 12 * 60 * 60 * 1000 },
-  })
-);
-app.use(passport.initialize());
-app.use(passport.session());
-app.use((req, res, next) => {
-  res.locals.user = req.user || null;
-  next();
-});
 
 /* ---------------- Helper: log + broadcast to admin ---------------- */
 async function logActivity({
@@ -119,7 +128,7 @@ app.get('/', (req, res) => res.render('landing', { title: 'VayaRide' }));
 app.use('/driver', driverAuthRouter);
 app.use('/admin', adminRouter);
 
-/* Rider dashboard token API */
+/* Rider dashboard token API (legacy) */
 app.get('/api/rider-by-token/:token', async (req, res) => {
   const token = req.params.token;
   const pin = req.query.pin;
@@ -142,6 +151,41 @@ app.get('/api/rider-by-token/:token', async (req, res) => {
     credit: rider.credit,
     trips: rider.trips || 0
   });
+});
+
+/* WhatsApp QR Code helpers */
+app.post('/wa/reset', async (req, res) => {
+  await resetWhatsAppSession();
+  res.json({ ok: true, message: 'WhatsApp session reset. Open /qrcode to scan again.' });
+});
+
+app.get('/qrcode', async (req, res) => {
+  if (isWhatsAppConnected()) {
+    return res.send('<h2>✅ WhatsApp is connected.</h2>');
+  }
+  try {
+    // wait up to 25s for a fresh QR if none cached
+    const dataUrl = await waitForQrDataUrl(25000);
+    res.send(`<div style="font-family:system-ui;display:grid;place-items:center;gap:12px">
+      <h3>Scan to connect WhatsApp</h3>
+      <img src="${dataUrl}" style="width:320px;height:320px;image-rendering:pixelated;border:8px solid #eee;border-radius:12px" />
+      <p>If it stalls, refresh or try <code>/wa/reset</code>.</p>
+    </div>`);
+  } catch {
+    const pngPath = path.join(__dirname, 'public/wa-qr.png');
+    const fallback = fs.existsSync(pngPath)
+      ? `<img src="/wa-qr.png" style="width:320px;height:320px;image-rendering:pixelated;border:8px solid #eee;border-radius:12px" />`
+      : '<em>No QR yet. Try again shortly.</em>';
+    res.send(`<div style="font-family:system-ui;display:grid;place-items:center;gap:12px">
+      <h3>QR not ready</h3>${fallback}
+      <p>Or call <a href="/wa/reset">/wa/reset</a> then refresh.</p>
+    </div>`);
+  }
+});
+
+app.get('/api/whatsapp/status', (req, res) => {
+  const status = getConnectionStatus();
+  res.json({ status, connected: isWhatsAppConnected() });
 });
 
 /* Profile update (dashboard) */
@@ -227,7 +271,11 @@ app.get('/api/driver-last-loc/:chatId', async (req, res) => {
     const chatId = Number(req.params.chatId);
     if (Number.isNaN(chatId)) return res.status(400).json({});
     const driver = await Driver.findOne({ chatId }).lean();
-    if (!driver || !driver.location) return res.json({});
+    if (!driver || !driver.location) {
+      console.log(`ℹ️ No last location for driver chatId=${chatId}`);
+      return res.json({});
+    }
+    console.log(`↩️ API last loc chatId=${chatId} lat=${driver.location.lat} lng=${driver.location.lng}`);
     res.json(driver.location);
   } catch {
     res.json({});
@@ -237,12 +285,14 @@ app.get('/api/driver-last-loc/:chatId', async (req, res) => {
 /* ---------------- Live driver broadcasts ---------------- */
 driverEvents.on('driver:location', async ({ chatId, location }) => {
   try {
+    console.log(`🛰  SOCKET OUT driver:${chatId}:location lat=${location.lat} lng=${location.lng}`);
     io.emit(`driver:${chatId}:location`, location);
 
     const ride = await Ride.findOne({ driverId: { $exists: true }, status: 'accepted' })
       .sort({ updatedAt: -1 })
       .lean();
     if (ride) {
+      console.log(`🛰  SOCKET OUT ride:${ride._id}:driverLocation lat=${location.lat} lng=${location.lng}`);
       io.emit(`ride:${ride._id}:driverLocation`, location);
     }
   } catch (e) {
@@ -256,7 +306,7 @@ async function dispatchToNearestDriver({ rideId, excludeDriverIds = [] }) {
   const ride = await Ride.findById(rideId);
   if (!ride || ride.status !== 'pending') return;
 
-  // Choose nearest driver (optionally consider vehicle type via your service)
+  // Choose nearest driver (Telegram)
   const chosen = await assignNearestDriver(ride.pickup, {
     vehicleType: ride.vehicleType || null,
     exclude: excludeDriverIds
@@ -264,20 +314,22 @@ async function dispatchToNearestDriver({ rideId, excludeDriverIds = [] }) {
 
   if (!chosen || !hasNumericChatId(chosen)) {
     try {
-      await RB.sendMessage(
-        ride.riderChatId,
-        '😕 No drivers are available right now. We’ll keep trying shortly.'
-      );
+      if (ride.riderChatId) {
+        await RB.sendMessage(ride.riderChatId, '😕 No drivers are available right now. We will keep trying shortly.');
+      }
+    } catch {}
+    try {
+      if (ride.riderWaJid) {
+        await sendWhatsAppMessage(ride.riderWaJid, '😕 No drivers are available right now. We will keep trying shortly.');
+      }
     } catch {}
     return;
   }
 
-  // Update estimate using chosen driver location (optional)
-  try {
-    await setEstimateOnRide(ride._id, chosen.location || null);
-  } catch {}
+  // Optional estimate using chosen driver location (if you want)
+  try { await setEstimateOnRide(ride._id, chosen.location || null); } catch {}
 
-  // ✨ Log assignment
+  // Log assignment
   await logActivity({
     rideId: ride._id,
     type: 'assigned',
@@ -292,7 +344,7 @@ async function dispatchToNearestDriver({ rideId, excludeDriverIds = [] }) {
     `• Vehicle: <b>${(ride.vehicleType || 'normal').toUpperCase()}</b>\n` +
     (ride.estimate ? `• Estimate: <b>R${ride.estimate}</b>\n` : '') +
     `• Pickup: <a href="${toMap(ride.pickup)}">Open Map</a>\n` +
-    `• Drop:   <a href="${toMap(ride.destination)}">Open Map</a>\n\n` +
+    `• Drop:   <a href="${toMap(ride.destination || ride.pickup)}">Open Map</a>\n\n` +
     `Accept to proceed.`;
 
   try {
@@ -310,29 +362,18 @@ async function dispatchToNearestDriver({ rideId, excludeDriverIds = [] }) {
   }
 }
 
-/* Rider clicked "Cash" (riderBot should emit booking:new with { rideId }) */
+/* Events (unchanged; WA notices added when applicable) */
 riderEvents.on('booking:new', async ({ rideId }) => {
   try {
     if (!rideId) return;
-
-    await logActivity({
-      rideId,
-      type: 'request',
-      actorType: 'rider',
-      message: 'Rider requested a trip (cash)'
-    });
-
+    await logActivity({ rideId, type: 'request', actorType: 'rider', message: 'Rider requested a trip' });
     await dispatchToNearestDriver({ rideId });
-  } catch (e) {
-    console.error('booking:new handler error:', e?.message || e);
-  }
+  } catch (e) { console.error('booking:new handler error:', e?.message || e); }
 });
 
-/* Driver ignored → try the next nearest */
 driverEvents.on('ride:ignored', async ({ previousDriverId, ride }) => {
   try {
     if (!ride || !ride._id) return;
-
     await logActivity({
       rideId: ride._id,
       type: 'ignored',
@@ -340,16 +381,12 @@ driverEvents.on('ride:ignored', async ({ previousDriverId, ride }) => {
       actorId: String(previousDriverId),
       message: `Driver ${previousDriverId} ignored the ride`
     });
-
     const prevDriver = await Driver.findOne({ chatId: Number(previousDriverId) }).lean();
     const excludeIds = prevDriver ? [prevDriver._id] : [];
     await dispatchToNearestDriver({ rideId: String(ride._id), excludeDriverIds: excludeIds });
-  } catch (e) {
-    console.error('ride:ignored handler error:', e?.message || e);
-  }
+  } catch (e) { console.error('ride:ignored handler error:', e?.message || e); }
 });
 
-/* Ride accepted: link driver + send tracking */
 driverEvents.on('ride:accepted', async ({ driverId, rideId }) => {
   try {
     const ride = await Ride.findById(rideId);
@@ -357,10 +394,7 @@ driverEvents.on('ride:accepted', async ({ driverId, rideId }) => {
 
     if (!ride.driverId) {
       const drv = await Driver.findOne({ chatId: Number(driverId) });
-      if (drv) {
-        ride.driverId = drv._id;
-        await ride.save();
-      }
+      if (drv) { ride.driverId = drv._id; await ride.save(); }
     }
 
     await logActivity({
@@ -372,14 +406,14 @@ driverEvents.on('ride:accepted', async ({ driverId, rideId }) => {
     });
 
     const link = `${process.env.PUBLIC_URL}/track.html?rideId=${encodeURIComponent(rideId)}`;
-    try { await RB.sendMessage(ride.riderChatId, `🚗 Your ride is on the way. Track here:\n${link}`); } catch {}
+    try { if (ride.riderChatId) await RB.sendMessage(ride.riderChatId, `🚗 Your ride is on the way. Track here:\n${link}`); } catch {}
+    try { if (ride.riderWaJid)  await sendWhatsAppMessage(ride.riderWaJid, `🚗 Your ride is on the way. Track here:\n${link}`); } catch {}
     try { await DB.sendMessage(driverId, `🗺️ Open the live trip map:\n${link}`); } catch {}
   } catch (e) {
     console.warn('ride:accepted handler failed:', e?.message || e);
   }
 });
 
-/* Optional rider notifications + activity logs */
 driverEvents.on('ride:arrived', async ({ rideId }) => {
   try {
     const ride = await Ride.findById(rideId);
@@ -392,7 +426,8 @@ driverEvents.on('ride:arrived', async ({ rideId }) => {
       message: 'Driver arrived at pickup'
     });
 
-    try { await RB.sendMessage(ride.riderChatId, '📍 Your driver has arrived at the pickup point.'); } catch {}
+    try { if (ride.riderChatId) await RB.sendMessage(ride.riderChatId, '📍 Your driver has arrived at the pickup point.'); } catch {}
+    try { if (ride.riderWaJid)  await sendWhatsAppMessage(ride.riderWaJid, '📍 Your driver has arrived at the pickup point.'); } catch {}
   } catch (e) {
     console.warn('ride:arrived handler failed:', e?.message || e);
   }
@@ -410,13 +445,13 @@ driverEvents.on('ride:started', async ({ rideId }) => {
       message: 'Trip started'
     });
 
-    try { await RB.sendMessage(ride.riderChatId, '▶️ Your trip has started. Enjoy the ride!'); } catch {}
+    try { if (ride.riderChatId) await RB.sendMessage(ride.riderChatId, '▶️ Your trip has started. Enjoy the ride!'); } catch {}
+    try { if (ride.riderWaJid)  await sendWhatsAppMessage(ride.riderWaJid, '▶️ Your trip has started. Enjoy the ride!'); } catch {}
   } catch (e) {
     console.warn('ride:started handler failed:', e?.message || e);
   }
 });
 
-/* If a driver cancels after accepting */
 driverEvents.on('ride:cancelled', async ({ ride, reason }) => {
   try {
     if (!ride) return;
@@ -429,14 +464,15 @@ driverEvents.on('ride:cancelled', async ({ ride, reason }) => {
       meta: { reason }
     });
 
-    try { await RB.sendMessage(ride.riderChatId, `❌ The driver cancelled the trip.\nReason: ${reason}`); } catch {}
+    try { if (ride.riderChatId) await RB.sendMessage(ride.riderChatId, `❌ The driver cancelled the trip.\nReason: ${reason}`); } catch {}
+    try { if (ride.riderWaJid)  await sendWhatsAppMessage(ride.riderWaJid, `❌ The driver cancelled the trip.\nReason: ${reason}`); } catch {}
   } catch (e) {
     console.warn('ride:cancelled handler failed:', e?.message || e);
   }
 });
 
 /* ---------------- Start server ---------------- */
+io.on('connection', (sock) => console.log('🔌 Socket connected:', sock.id));
 server.listen(PORT, () => {
   console.log(`🚀 Server is running at http://localhost:${PORT}`);
-  io.on('connection', (sock) => console.log('🔌 Socket connected:', sock.id));
 });

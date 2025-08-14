@@ -6,7 +6,7 @@ import Ride from '../models/Ride.js';
 
 export const driverEvents = new EventEmitter();
 
-// singletons
+// singletons (match your project style)
 let bot = null;
 let ioRef = null;
 
@@ -68,11 +68,13 @@ async function linkDriverByEmail(email, msg) {
   const chatId = toNum(msg.chat.id);
   const tgUsername = msg.from?.username || null;
 
+  // exact, case-insensitive
   const emailRegex = new RegExp(
     `^${email.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`,
     'i'
   );
 
+  // ensure this chatId is not attached elsewhere
   await Driver.updateMany({ chatId }, { $unset: { chatId: '' } });
 
   const driver = await Driver.findOneAndUpdate(
@@ -98,15 +100,9 @@ function tripControls(rideId) {
   return {
     reply_markup: {
       inline_keyboard: [
-        [
-          { text: '📍 Arrived at Pickup', callback_data: `arrived_${rideId}` }
-        ],
-        [
-          { text: '▶️ Start Trip', callback_data: `start_${rideId}` }
-        ],
-        [
-          { text: '❌ Cancel Ride', callback_data: `cancel_${rideId}` }
-        ]
+        [{ text: '📍 Arrived at Pickup', callback_data: `arrived_${rideId}` }],
+        [{ text: '▶️ Start Trip', callback_data: `start_${rideId}` }],
+        [{ text: '❌ Cancel Ride', callback_data: `cancel_${rideId}` }]
       ]
     }
   };
@@ -123,6 +119,8 @@ export function initDriverBot(io) {
   if (!token) throw new Error('TELEGRAM_DRIVER_BOT_TOKEN is not defined in .env');
 
   ioRef = io || null;
+
+  // Polling with allowed updates incl. edited_message for live location
   bot = new TelegramBot(token, {
     polling: {
       interval: 300,
@@ -134,13 +132,14 @@ export function initDriverBot(io) {
     }
   });
 
-  const pendingCancellations = new Map();
-
   // expose approval helper
   bot.sendApprovalNotice = sendApprovalNoticeInternal;
 
+  // in-memory cancel state
+  const pendingCancellations = new Map();
+
   /* ---------------- /start ---------------- */
-  bot.onText(/\/start/, async (msg) => {
+  bot.onText(/\/start\b/, async (msg) => {
     const chatId = toNum(msg.chat.id);
     let driver = await getOrLinkDriverByChat(msg);
 
@@ -270,22 +269,20 @@ export function initDriverBot(io) {
     );
   });
 
-  // quick helper command to pop the location keyboard
+  // quick helper to pop location keyboard
   bot.onText(/^\/loc$/, async (msg) => {
     const chatId = toNum(msg.chat.id);
     await bot.sendMessage(chatId, 'Tap below to send your location:', locationKeyboard());
   });
 
-  /* ---------------- location ---------------- */
-  bot.on('message', async (msg) => {
-    if (!msg?.location) return;
-    const chatId = toNum(msg.chat.id);
-    const { latitude, longitude } = msg.location || {};
+  /* ---------------- location (one-off & live) ---------------- */
+  async function recordAndBroadcastLocation(chatId, latitude, longitude) {
     if (typeof latitude !== 'number' || typeof longitude !== 'number') return;
 
-    // Persist latest location + mark online
+    console.log(`📥 DRIVER LOC <- chatId=${chatId} lat=${latitude} lng=${longitude}`);
+
     await Driver.findOneAndUpdate(
-      { chatId },
+      { chatId: Number(chatId) },
       {
         $set: {
           location: { lat: latitude, lng: longitude },
@@ -296,45 +293,35 @@ export function initDriverBot(io) {
       { new: true }
     );
 
-    // Emit for maps/clients
+    // Emit for server.js → Socket.IO → clients
+    console.log(`📤 EMIT driver:location -> chatId=${Number(chatId)} lat=${latitude} lng=${longitude}`);
     driverEvents.emit('driver:location', {
-      chatId,
-      driverId: chatId,
+      chatId: Number(chatId),
       location: { lat: latitude, lng: longitude }
     });
+  }
 
-    // Tiny acknowledgement
+  // One-off & live initial (user sends a location message)
+  bot.on('message', async (msg) => {
+    const loc = msg?.location;
+    if (!loc) return;
+    const chatId = toNum(msg.chat.id);
+    await recordAndBroadcastLocation(chatId, loc.latitude, loc.longitude);
     try { await bot.sendMessage(chatId, '📍 Location updated. Thanks!'); } catch {}
   });
 
-  /* LIVE location edits from Telegram (driver live location keeps moving) */
+  // Live location subsequent updates (Telegram edits the same message)
   bot.on('edited_message', async (msg) => {
-    if (!msg?.location) return;
-    const chatId = Number(msg.chat.id);
-    const { latitude, longitude } = msg.location;
-
-    await Driver.findOneAndUpdate(
-      { chatId },
-      {
-        $set: {
-          location: { lat: latitude, lng: longitude },
-          lastSeenAt: new Date(),
-          isAvailable: true
-        }
-      }
-    );
-
-    driverEvents.emit('driver:location', {
-      chatId,
-      driverId: chatId,
-      location: { lat: latitude, lng: longitude }
-    });
+    const loc = msg?.location;
+    if (!loc) return;
+    const chatId = toNum(msg.chat.id);
+    await recordAndBroadcastLocation(chatId, loc.latitude, loc.longitude);
   });
 
   /* ------------- inline button actions -------------- */
   bot.on('callback_query', async (query) => {
     const chatId = toNum(query.message.chat.id);
-    const data = query.data;
+    const data = String(query.data || '');
 
     try {
       // availability toggles
@@ -372,39 +359,40 @@ export function initDriverBot(io) {
         return;
       }
 
-      // ride actions: ACCEPT/IGNORE from the offer
+      // ride actions: ACCEPT/IGNORE
       if (data.startsWith('accept_')) {
         const rideId = data.replace('accept_', '');
         const ride = await Ride.findById(rideId);
-        if (!ride) return;
+        if (!ride) {
+          await bot.answerCallbackQuery({ callback_query_id: query.id, text: 'Ride not found' });
+          return;
+        }
 
-        // store accepting driver on ride
-        const driver = await Driver.findOne({ chatId });
-        if (driver) ride.driverId = driver._id;
-
+        const driver = await Driver.findOne({ chatId: Number(chatId) });
+        if (driver && !ride.driverId) {
+          ride.driverId = driver._id;
+        }
         ride.status = 'accepted';
         await ride.save();
 
+        await bot.answerCallbackQuery({ callback_query_id: query.id, text: 'Ride accepted' });
         await bot.sendMessage(chatId, '✅ You accepted the ride.', tripControls(rideId));
-        driverEvents.emit('ride:accepted', { driverId: chatId, rideId });
 
+        console.log(`✅ Driver ${chatId} accepted ride ${rideId}`);
+        driverEvents.emit('ride:accepted', { driverId: chatId, rideId });
         return;
       }
 
       if (data.startsWith('ignore_')) {
         const rideId = data.replace('ignore_', '');
         const ride = await Ride.findById(rideId);
-        if (!ride) return;
-
-        ride.driverId = null;
-        ride.status = 'pending';
-        await ride.save();
-        await bot.sendMessage(chatId, '❌ You ignored the ride.');
-        driverEvents.emit('ride:ignored', { previousDriverId: chatId, ride });
+        await bot.answerCallbackQuery({ callback_query_id: query.id, text: 'Ignored' });
+        if (ride) driverEvents.emit('ride:ignored', { previousDriverId: chatId, ride });
+        console.log(`🙈 Driver ${chatId} ignored ride ${rideId}`);
         return;
       }
 
-      // new: arrived at pickup
+      // arrived at pickup
       if (data.startsWith('arrived_')) {
         const rideId = data.replace('arrived_', '');
         const ride = await Ride.findById(rideId);
@@ -413,12 +401,12 @@ export function initDriverBot(io) {
         await bot.answerCallbackQuery({ callback_query_id: query.id, text: 'Marked arrived' });
         await bot.sendMessage(chatId, '📍 Marked as arrived at pickup.', tripControls(rideId));
 
-        // server will notify rider
+        console.log(`📍 Driver ${chatId} arrived for ride ${rideId}`);
         driverEvents.emit('ride:arrived', { driverId: chatId, rideId });
         return;
       }
 
-      // new: start trip (set status → enroute)
+      // start trip (→ enroute)
       if (data.startsWith('start_')) {
         const rideId = data.replace('start_', '');
         const ride = await Ride.findById(rideId);
@@ -436,7 +424,7 @@ export function initDriverBot(io) {
           }
         });
 
-        // server will notify rider
+        console.log(`▶️ Driver ${chatId} started ride ${rideId}`);
         driverEvents.emit('ride:started', { driverId: chatId, rideId });
         return;
       }
@@ -483,8 +471,8 @@ export function initDriverBot(io) {
         ride.cancelReason = reason;
         await ride.save();
 
+        console.log(`❌ Driver ${chatId} cancelled ride ${rideId}: ${reason}`);
         driverEvents.emit('ride:cancelled', { ride, reason });
-
         await bot.sendMessage(chatId, '✅ Ride cancelled.');
         pendingCancellations.delete(chatId);
         return;

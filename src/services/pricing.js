@@ -137,7 +137,6 @@ export async function getAvailableVehicleQuotes({ pickup, destination, radiusKm 
     };
   });
 
-  // Sort by displayed price ascending
   quotes.sort((a, b) => a.price - b.price);
   return quotes;
 }
